@@ -50,6 +50,29 @@ def norm_arr(img: np.ndarray) -> np.ndarray:
 
     return res.astype(np.uint8)
 
+def norm_arr_clip_zscore(img: np.ndarray,
+                         hu_min: float = -986.0,
+                         hu_max: float = 271.0) -> np.ndarray:
+    """Clip to a fixed HU window, z-score normalize, then map to 0-255.
+
+    norm_arr rescales by each volume's own min/max, so a single artifact
+    voxel (sanity_ct tolerates up to 31743 HU) rescales the whole scan.
+    A fixed window keeps the mapping consistent across patients.
+    Window [-986, 271] follows nnU-Net's published SegTHOR config.
+    """
+    casted = img.astype(np.float32)
+    clipped = np.clip(casted, hu_min, hu_max)
+
+    mean = clipped.mean()
+    std = clipped.std()
+    if std < 1e-8:
+        return np.zeros_like(clipped, dtype=np.uint8)
+
+    z = np.clip((clipped - mean) / std, -3.0, 3.0)
+    res = (z + 3.0) / 6.0 * 255.0
+
+    return res.astype(np.uint8)
+
 
 def sanity_ct(ct, x, y, z, dx, dy, dz) -> bool:
     assert ct.dtype in [np.int16, np.int32], ct.dtype
@@ -81,7 +104,9 @@ resize_: Callable = partial(resize, mode="constant", preserve_range=True, anti_a
 
 
 def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int, int],
-                  test_mode: bool = False) -> tuple[float, float, float]:
+                  test_mode: bool = False, norm_mode: str = "minmax",
+                  hu_window: tuple[float, float] = (-986.0, 271.0),
+                  skip_empty: bool = False) -> tuple[float, float, float]:
     id_path: Path = source_path / ("train" if not test_mode else "test") / id_
 
     ct_path: Path = (id_path / f"{id_}.nii.gz") if not test_mode else (source_path / "test" / f"{id_}.nii.gz")
@@ -103,7 +128,11 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
     else:
         gt = np.zeros_like(ct, dtype=np.uint8)
 
-    norm_ct: np.ndarray = norm_arr(ct)
+    norm_ct: np.ndarray
+    if norm_mode == "zscore":
+        norm_ct = norm_arr_clip_zscore(ct, hu_window[0], hu_window[1])
+    else:
+        norm_ct = norm_arr(ct)
 
     to_slice_ct = norm_ct
     to_slice_gt = gt
@@ -113,6 +142,10 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
         gt_slice = resize_(to_slice_gt[:, :, idz], shape, order=0).astype(np.uint8)
         assert img_slice.shape == gt_slice.shape
         gt_slice *= 63
+        # Train only on slices containing at least one organ (SegTHOR paper,
+        # sec. 4.1). Never skip in test_mode: stitching needs every slice.
+        if skip_empty and not test_mode and not gt_slice.any():
+            continue
         assert gt_slice.dtype == np.uint8, gt_slice.dtype
         # assert set(np.unique(gt_slice)) <= set(range(5))
         assert set(np.unique(gt_slice)) <= set([0, 63, 126, 189, 252]), np.unique(gt_slice)
@@ -180,7 +213,10 @@ def main(args: argparse.Namespace):
                                  dest_path=dest_mode,
                                  source_path=src_path,
                                  shape=tuple(args.shape),
-                                 test_mode=mode == 'test')
+                                 test_mode=mode == 'test',
+                                 norm_mode=args.norm_mode,
+                                 hu_window=tuple(args.hu_window),
+                                 skip_empty=args.skip_empty and mode == 'train')
         resolutions: list[tuple[float, float, float]]
         iterator = tqdm_(split_ids)
         match args.process:
@@ -210,6 +246,14 @@ def get_args() -> argparse.Namespace:
     parser.add_argument('--fold', type=int, default=0)
     parser.add_argument('--process', '-p', type=int, default=1,
                         help="The number of cores to use for processing")
+    parser.add_argument('--norm_mode', type=str, default='minmax',
+                        choices=['minmax', 'zscore'],
+                        help="minmax = original per-volume min-max; "
+                             "zscore = clip to HU window then z-score")
+    parser.add_argument('--hu_window', type=float, nargs=2, default=[-986.0, 271.0],
+                        metavar=('MIN', 'MAX'))
+    parser.add_argument('--skip_empty', action='store_true',
+                        help="Skip slices containing no organ (train/val only)")
     args = parser.parse_args()
     random.seed(args.seed)
 
