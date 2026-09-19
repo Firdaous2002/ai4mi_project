@@ -21,7 +21,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
+import random
 import argparse
 import warnings
 from typing import Any
@@ -76,9 +76,27 @@ def gt_transform(K, img):
         img = torch.tensor(img, dtype=torch.int64)[None, ...]  # Add one dimension to simulate batch
         img = class2one_hot(img, K=K)
         return img[0]
+def set_seed(seed: int) -> None:
+    """Make a run reproducible: same weights init, same batch order.
 
+    Without this, two runs of the same configuration differ by an amount
+    comparable to the effect we are trying to measure, so we cannot tell a
+    real improvement from noise.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(worker_id: int) -> None:
+    """DataLoader workers get their own RNG state; seed those too."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     # Networks and scheduler
+    set_seed(args.seed)
     gpu: bool = args.gpu and torch.cuda.is_available()
     device = torch.device("cuda") if gpu else torch.device("cpu")
     print(f">> Picked {device} to run experiments")
@@ -104,10 +122,15 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                              img_transform=img_transform,
                              gt_transform= partial(gt_transform, K),
                              debug=args.debug)
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     train_loader = DataLoader(train_set,
                               batch_size=B,
                               num_workers=5,
-                              shuffle=True)
+                              shuffle=True,
+                              worker_init_fn=seed_worker,
+                              generator=g)
 
     val_set = SliceDataset('val',
                            root_dir,
@@ -117,7 +140,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     val_loader = DataLoader(val_set,
                             batch_size=B,
                             num_workers=5,
-                            shuffle=False)
+                            shuffle=False,
+                            worker_init_fn=seed_worker)
 
     args.dest.mkdir(parents=True, exist_ok=True)
 
@@ -245,6 +269,11 @@ def main():
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
+
+    parser.add_argument('--seed', default=0, type=int,
+                        help="Random seed for weight init and batch shuffling, "
+                             "so runs are reproducible and differences between "
+                             "configurations are attributable.")
 
     args = parser.parse_args()
 
